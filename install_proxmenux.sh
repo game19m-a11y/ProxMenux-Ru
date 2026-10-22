@@ -1,0 +1,948 @@
+#!/bin/bash
+
+# ==========================================================
+# ProxMenux - A menu-driven toolkit for Proxmox VE management
+# ==========================================================
+# Author       : MacRimi
+# Contributors : cod378
+# Subproject   : ProxMenux Monitor (System Health & Web Dashboard)
+# Copyright    : (c) 2024-2025 MacRimi
+# License      : (GPL-3.0) (https://github.com/MacRimi/ProxMenux/blob/main/LICENSE)
+# Version      : 1.4
+# Last Updated : 12/11/2025
+# ==========================================================
+# Description:
+# This script installs and configures ProxMenux, a menu-driven
+# toolkit for managing and optimizing Proxmox VE servers.
+#
+# - Ensures the script is run with root privileges.
+# - Displays an installation confirmation prompt.
+# - Installs required dependencies:
+#     • whiptail (interactive terminal menus)
+#     • curl (downloads and connectivity checks)
+#     • jq (JSON parsing)
+#     • Python 3 + venv (for translation support)
+# - Creates the ProxMenux base directories and configuration files:
+#     • $BASE_DIR/config.json
+#     • $BASE_DIR/cache.json
+# - Copies local project files into the target paths (offline mode by default):
+#     • scripts/*     → $BASE_DIR/scripts/
+#     • utils.sh      → $BASE_DIR/scripts/utils.sh
+#     • menu          → $INSTALL_DIR/menu (main launcher)
+#     • install_proxmenux.sh → $BASE_DIR/install_proxmenux.sh
+# - Sets correct permissions for all executables.
+# - Displays the final instruction on how to start ProxMenux ("menu").
+#
+# Notes:
+# - This installer supports both offline and online setups.
+# - ProxMenux Monitor can be installed later as an optional module
+#   to provide real-time system monitoring and a web dashboard.
+# ==========================================================
+
+# Configuration ============================================
+LOCAL_SCRIPTS="/usr/local/share/proxmenux/scripts"
+INSTALL_DIR="/usr/local/bin"
+BASE_DIR="/usr/local/share/proxmenux"
+CONFIG_FILE="$BASE_DIR/config.json"
+UTILS_FILE="$BASE_DIR/utils.sh"
+LOCAL_VERSION_FILE="$BASE_DIR/version.txt"
+MENU_SCRIPT="menu"
+
+# Legacy path that existed during the Python+googletrans era. The current
+# translate flow uses pre-generated JSON files in lang/ — no virtualenv,
+# no online translation at runtime — so this path is purged on install
+# if present. Kept as a literal here so the cleanup is grep-able.
+LEGACY_VENV_PATH="/opt/googletrans-env"
+
+MONITOR_INSTALL_DIR="$BASE_DIR"
+MONITOR_RUNTIME_DIR="$BASE_DIR/monitor-app"
+MONITOR_SERVICE_FILE="/etc/systemd/system/proxmenux-monitor.service"
+MONITOR_PORT=8008
+
+# Offline installer envs
+REPO_URL="https://github.com/MacRimi/ProxMenux.git"
+TEMP_DIR="/tmp/proxmenux-install-$$"
+
+# Load utility functions
+NEON_PURPLE_BLUE="\033[38;5;99m"
+WHITE="\033[38;5;15m" 
+RESET="\033[0m"  
+DARK_GRAY="\033[38;5;244m"
+ORANGE="\033[38;5;208m"
+YW="\033[33m"
+YWB="\033[1;33m"
+MG="\033[1;35m"
+GN="\033[1;92m"
+RD="\033[01;31m"
+CL="\033[m"
+BL="\033[36m"
+DGN="\e[32m"
+BGN="\e[1;32m"
+DEF="\e[1;36m"
+CUS="\e[38;5;214m"
+BOLD="\033[1m"
+BFR="\\r\\033[K"
+HOLD="-"
+BOR=" | "
+CM="${GN}✓ ${CL}"
+TAB="    "   
+
+
+# Create and display spinner
+spinner() {
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local spin_i=0
+    local interval=0.1
+    printf "\e[?25l"
+    
+    local color="${MG}"
+
+    while true; do
+        printf "\r ${color}%s${CL}" "${frames[spin_i]}"
+        spin_i=$(( (spin_i + 1) % ${#frames[@]} ))
+        sleep "$interval"
+    done
+}
+
+
+# Function to simulate typing effect
+type_text() {
+    local text="$1"
+    local delay=0.05
+    for ((i=0; i<${#text}; i++)); do
+        echo -n "${text:$i:1}"
+        sleep $delay
+    done
+    echo
+}
+
+
+# Display info message with spinner
+msg_info() {
+    local msg="$1"
+    echo -ne "${TAB}${MG}${HOLD}${msg}"
+    spinner &
+    SPINNER_PID=$!
+}
+
+
+# Display info2 message
+msg_info2() {
+    local msg="$1"
+    echo -e "${TAB}${BOLD}${YW}${HOLD}${msg}${CL}"
+}
+
+
+
+# Display title script
+msg_title() {
+    local msg="$1"
+    echo -e "\n"
+    echo -e "${TAB}${BOLD}${HOLD}${BOR}${msg}${BOR}${HOLD}${CL}"
+    echo -e "\n"
+}
+
+
+# Display warning or highlighted information message
+msg_warn() {
+    if [ -n "$SPINNER_PID" ] && ps -p $SPINNER_PID > /dev/null; then 
+        kill $SPINNER_PID > /dev/null
+    fi
+    printf "\e[?25h"
+    local msg="$1"
+    echo -e "${BFR}${TAB}${CL} ${YWB}${msg}${CL}"
+}
+
+
+# Display success message
+msg_ok() {
+    if [ -n "$SPINNER_PID" ] && ps -p $SPINNER_PID > /dev/null; then 
+        kill $SPINNER_PID > /dev/null
+    fi
+    printf "\e[?25h"
+    local msg="$1"
+    echo -e "${BFR}${TAB}${CM}${GN}${msg}${CL}"
+}
+
+
+# Display error message
+msg_error() {
+    if [ -n "$SPINNER_PID" ] && ps -p $SPINNER_PID > /dev/null; then 
+        kill $SPINNER_PID > /dev/null
+    fi
+    printf "\e[?25h"
+    local msg="$1"
+    echo -e "${BFR}${TAB}${RD}[ERROR] ${msg}${CL}"
+}
+    
+
+
+
+show_proxmenux_logo() {
+clear
+
+if [[ -z "$SSH_TTY" && -z "$(who am i | awk '{print $NF}' | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}')" ]]; then
+
+# Logo for terminal noVNC
+
+LOGO=$(cat << "EOF"
+\e[0m\e[38;2;61;61;61m▆\e[38;2;60;60;60m▄\e[38;2;54;54;54m▂\e[0m \e[38;2;0;0;0m             \e[0m \e[38;2;54;54;54m▂\e[38;2;60;60;60m▄\e[38;2;61;61;61m▆\e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[38;2;61;61;61;48;2;37;37;37m▇\e[0m\e[38;2;60;60;60m▅\e[38;2;56;56;56m▃\e[38;2;37;37;37m▁       \e[38;2;36;36;36m▁\e[38;2;56;56;56m▃\e[38;2;60;60;60m▅\e[38;2;61;61;61;48;2;37;37;37m▇\e[48;2;62;62;62m  \e[0m\e[7m\e[38;2;60;60;60m▁\e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[0m\e[7m\e[38;2;61;61;61m▂\e[0m\e[38;2;62;62;62;48;2;61;61;61m┈\e[48;2;62;62;62m \e[48;2;61;61;61m┈\e[0m\e[38;2;60;60;60m▆\e[38;2;57;57;57m▄\e[38;2;48;48;48m▂\e[0m \e[38;2;47;47;47m▂\e[38;2;57;57;57m▄\e[38;2;60;60;60m▆\e[38;2;62;62;62;48;2;61;61;61m┈\e[48;2;62;62;62m \e[48;2;61;61;61m┈\e[0m\e[7m\e[38;2;60;60;60m▂\e[38;2;57;57;57m▄\e[38;2;47;47;47m▆\e[0m \e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[0m\e[38;2;32;32;32m▏\e[7m\e[38;2;39;39;39m▇\e[38;2;57;57;57m▅\e[38;2;60;60;60m▃\e[0m\e[38;2;40;40;40;48;2;61;61;61m▁\e[48;2;62;62;62m  \e[38;2;54;54;54;48;2;61;61;61m┊\e[48;2;62;62;62m  \e[38;2;39;39;39;48;2;61;61;61m▁\e[0m\e[7m\e[38;2;60;60;60m▃\e[38;2;57;57;57m▅\e[38;2;38;38;38m▇\e[0m \e[38;2;193;60;2m▃\e[38;2;217;67;2m▅\e[38;2;225;70;2m▇\e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[0m\e[38;2;32;32;32m▏\e[0m \e[38;2;203;63;2m▄\e[38;2;147;45;1m▂\e[0m \e[7m\e[38;2;55;55;55m▆\e[38;2;60;60;60m▄\e[38;2;61;61;61m▂\e[38;2;60;60;60m▄\e[38;2;55;55;55m▆\e[0m \e[38;2;144;44;1m▂\e[38;2;202;62;2m▄\e[38;2;219;68;2m▆\e[38;2;231;72;3;48;2;226;70;2m┈\e[48;2;231;72;3m  \e[48;2;225;70;2m▉\e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[0m\e[38;2;32;32;32m▏\e[7m\e[38;2;121;37;1m▉\e[0m\e[38;2;0;0;0;48;2;231;72;3m  \e[0m\e[38;2;221;68;2m▇\e[38;2;208;64;2m▅\e[38;2;212;66;2m▂\e[38;2;123;37;0m▁\e[38;2;211;65;2m▂\e[38;2;207;64;2m▅\e[38;2;220;68;2m▇\e[48;2;231;72;3m  \e[38;2;231;72;3;48;2;225;70;2m┈\e[0m\e[7m\e[38;2;221;68;2m▂\e[0m\e[38;2;44;13;0;48;2;231;72;3m  \e[38;2;231;72;3;48;2;225;70;2m▉\e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[0m\e[38;2;32;32;32m▏\e[0m \e[7m\e[38;2;190;59;2m▅\e[38;2;216;67;2m▃\e[38;2;225;70;2m▁\e[0m\e[38;2;95;29;0;48;2;231;72;3m  \e[38;2;231;72;3;48;2;230;71;2m┈\e[48;2;231;72;3m  \e[0m\e[7m\e[38;2;225;70;2m▁\e[38;2;216;67;2m▃\e[38;2;191;59;2m▅\e[0m  \e[38;2;0;0;0;48;2;231;72;3m  \e[38;2;231;72;3;48;2;225;70;2m▉\e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[0m\e[38;2;32;32;32m▏   \e[0m \e[7m\e[38;2;172;53;1m▆\e[38;2;213;66;2m▄\e[38;2;219;68;2m▂\e[38;2;213;66;2m▄\e[38;2;174;54;2m▆\e[0m \e[38;2;0;0;0m   \e[0m \e[38;2;0;0;0;48;2;231;72;3m  \e[38;2;231;72;3;48;2;225;70;2m▉\e[0m
+\e[38;2;59;59;59;48;2;62;62;62m▏  \e[0m\e[38;2;32;32;32m▏             \e[0m \e[38;2;0;0;0;48;2;231;72;3m  \e[38;2;231;72;3;48;2;225;70;2m▉\e[0m
+\e[7m\e[38;2;52;52;52m▆\e[38;2;59;59;59m▄\e[38;2;61;61;61m▂\e[0m\e[38;2;31;31;31m▏             \e[0m \e[7m\e[38;2;228;71;2m▂\e[38;2;221;69;2m▄\e[38;2;196;60;2m▆\e[0m
+EOF
+)
+
+
+TEXT=(
+    ""
+    ""
+    "${BOLD}ProxMenux${RESET}"
+    ""
+    "${BOLD}${NEON_PURPLE_BLUE}An Interactive Menu for${RESET}"
+    "${BOLD}${NEON_PURPLE_BLUE}Proxmox VE management${RESET}"
+    ""
+    ""
+    ""
+    ""
+)
+
+
+mapfile -t logo_lines <<< "$LOGO"
+
+for i in {0..9}; do
+    echo -e "${TAB}${logo_lines[i]}  ${WHITE}│${RESET}  ${TEXT[i]}"
+done
+echo -e
+
+else
+
+
+# Logo for terminal SSH     
+TEXT=(
+    ""
+    ""
+    ""
+    ""
+    "${BOLD}ProxMenux${RESET}"
+    ""
+    "${BOLD}${NEON_PURPLE_BLUE}An Interactive Menu for${RESET}"
+    "${BOLD}${NEON_PURPLE_BLUE}Proxmox VE management${RESET}"
+    ""
+    ""
+    ""
+    ""
+    ""
+    ""
+)
+
+LOGO=(
+    "${DARK_GRAY}░░░░                     ░░░░${RESET}"
+    "${DARK_GRAY}░░░░░░░               ░░░░░░ ${RESET}"
+    "${DARK_GRAY}░░░░░░░░░░░       ░░░░░░░    ${RESET}"
+    "${DARK_GRAY}░░░░    ░░░░░░ ░░░░░░      ${ORANGE}░░${RESET}"
+    "${DARK_GRAY}░░░░       ░░░░░░░      ${ORANGE}░░▒▒▒${RESET}"
+    "${DARK_GRAY}░░░░         ░░░     ${ORANGE}░▒▒▒▒▒▒▒${RESET}"
+    "${DARK_GRAY}░░░░   ${ORANGE}▒▒▒░       ░▒▒▒▒▒▒▒▒▒▒${RESET}"
+    "${DARK_GRAY}░░░░   ${ORANGE}░▒▒▒▒▒   ▒▒▒▒▒░░  ▒▒▒▒${RESET}"
+    "${DARK_GRAY}░░░░     ${ORANGE}░░▒▒▒▒▒▒▒░░     ▒▒▒▒${RESET}"
+    "${DARK_GRAY}░░░░         ${ORANGE}░░░         ▒▒▒▒${RESET}"
+    "${DARK_GRAY}░░░░                     ${ORANGE}▒▒▒▒${RESET}"
+    "${DARK_GRAY}░░░░                     ${ORANGE}▒▒▒░${RESET}"
+    "${DARK_GRAY}  ░░                     ${ORANGE}░░  ${RESET}"
+)
+
+for i in {0..12}; do
+    echo -e "${TAB}${LOGO[i]}  │${RESET}  ${TEXT[i]}"
+done
+echo -e
+fi
+
+}
+
+# ==========================================================
+
+
+
+
+
+cleanup_corrupted_files() {
+    if [ -f "$CONFIG_FILE" ] && ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo "Cleaning up corrupted configuration file..."
+        rm -f "$CONFIG_FILE"
+    fi
+}
+
+# Cleanup function
+cleanup() {
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+}
+
+# Set trap to ensure cleanup on exit
+trap cleanup EXIT
+
+
+# ==========================================================
+check_existing_installation() {
+    # After the googletrans removal there is only one install variant.
+    # The function still distinguishes "installed" vs "not installed" so
+    # show_installation_options can pick the right banner.
+    if [ -f "$INSTALL_DIR/$MENU_SCRIPT" ]; then
+        # Quietly fix a corrupted config so the install can proceed.
+        if [ -f "$CONFIG_FILE" ] && ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo "Warning: Corrupted config file detected, removing..." >&2
+            rm -f "$CONFIG_FILE"
+        fi
+        echo "installed"
+    else
+        echo "none"
+    fi
+}
+
+update_config() {
+    local component="$1"
+    local status="$2"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    local tracked_components=("dialog" "curl" "jq" "git" "python3" "python3-pip" "proxmenux_monitor")
+    
+    if [[ " ${tracked_components[@]} " =~ " ${component} " ]]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        
+        if [ ! -f "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo '{}' > "$CONFIG_FILE"
+        fi
+        
+        local tmp_file=$(mktemp)
+        if jq --arg comp "$component" --arg stat "$status" --arg time "$timestamp" \
+           '.[$comp] = {status: $stat, timestamp: $time}' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null; then
+            mv "$tmp_file" "$CONFIG_FILE"
+        else
+            echo '{}' > "$CONFIG_FILE"
+            jq --arg comp "$component" --arg stat "$status" --arg time "$timestamp" \
+               '.[$comp] = {status: $stat, timestamp: $time}' "$CONFIG_FILE" > "$tmp_file" && mv "$tmp_file" "$CONFIG_FILE"
+        fi
+        
+        [ -f "$tmp_file" ] && rm -f "$tmp_file"
+    fi
+}
+
+show_progress() {
+    local step="$1"
+    local total="$2"
+    local message="$3"
+    
+    echo -e "\n${BOLD}${BL}${TAB}Installing ProxMenux: Step $step of $total${CL}"
+    echo
+    msg_info2 "$message"
+}
+
+select_language() {
+    if [ -f "$CONFIG_FILE" ] && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        local existing_language=$(jq -r '.language // empty' "$CONFIG_FILE" 2>/dev/null)
+        if [[ -n "$existing_language" && "$existing_language" != "null" && "$existing_language" != "empty" ]]; then
+            LANGUAGE="$existing_language"
+            msg_ok "Using existing language configuration: $LANGUAGE"
+            return 0
+        fi
+    fi
+    
+    LANGUAGE=$(whiptail --title "Select Language" --menu "Choose a language for the menu:" 20 60 12 \
+        "en" "English" \
+        "es" "Spanish" \
+        "fr" "French" \
+        "de" "German" \
+        "it" "Italian" \
+        "pt" "Portuguese" \
+        "ru" "Русский" \
+        "sk" "Slovenčina" \
+        "sv" "Svenska" 3>&1 1>&2 2>&3)
+    
+    if [ -z "$LANGUAGE" ]; then
+        msg_error "No language selected. Exiting."
+        exit 1
+    fi
+    
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    
+    if [ ! -f "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo '{}' > "$CONFIG_FILE"
+    fi
+    
+    local tmp_file=$(mktemp)
+    if jq --arg lang "$LANGUAGE" '. + {language: $lang}' "$CONFIG_FILE" > "$tmp_file" 2>/dev/null; then
+        mv "$tmp_file" "$CONFIG_FILE"
+    else
+        echo "{\"language\": \"$LANGUAGE\"}" > "$CONFIG_FILE"
+    fi
+    
+    [ -f "$tmp_file" ] && rm -f "$tmp_file"
+    
+    msg_ok "Language set to: $LANGUAGE"
+}
+
+# Show installation confirmation for new installations
+show_installation_confirmation() {
+    if whiptail --title "ProxMenux Installation" \
+        --yesno "ProxMenux will install:\n\n• dialog       (interactive menus) - Official Debian package\n• curl         (file downloads) - Official Debian package\n• jq           (JSON processing) - Official Debian package\n• ProxMenux core files     (/usr/local/share/proxmenux)\n• ProxMenux Monitor        (Web dashboard on port 8008)\n• Pre-built translation files\n\nProceed with installation?" 20 70; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+get_server_ip() {
+    local ip
+    # Try to get the primary IP address
+    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+')
+    
+    if [ -z "$ip" ]; then
+        # Fallback: get first non-loopback IP
+        ip=$(hostname -I | awk '{print $1}')
+    fi
+    
+    if [ -z "$ip" ]; then
+        # Last resort: use localhost
+        ip="localhost"
+    fi
+    
+    echo "$ip"
+}
+
+detect_latest_appimage() {
+    local appimage_dir="$TEMP_DIR/AppImage"
+    
+    if [ ! -d "$appimage_dir" ]; then
+        return 1
+    fi
+    
+    local latest_appimage=$(find "$appimage_dir" -name "ProxMenux-*.AppImage" -type f | sort -V | tail -1)
+    
+    if [ -z "$latest_appimage" ]; then
+        return 1
+    fi
+    
+    echo "$latest_appimage"
+    return 0
+}
+
+get_appimage_version() {
+    local appimage_path="$1"
+    local filename=$(basename "$appimage_path")
+
+    # Match any dotted number sequence + optional pre-release suffix
+    # (e.g. "-beta"). The previous `[0-9]+\.[0-9]+\.[0-9]+` was hardcoded
+    # to three segments and dropped both the fourth segment AND the
+    # `-beta` suffix on a name like `ProxMenux-1.2.1.2-beta.AppImage`.
+    local version=$(echo "$filename" | grep -oP 'ProxMenux-\K[0-9]+(?:\.[0-9]+)+(?:-[A-Za-z0-9]+)?')
+
+    echo "$version"
+}
+
+# ── AppImage runtime extraction ────────────────────────────
+# Extract the AppImage's squashfs to a stable directory and run AppRun
+# directly. Avoids the FUSE mount under /tmp/.mount_ProxMe<random>, which
+# trips Wazuh rule 521 / rkhunter "Possible kernel level rootkit" alerts
+# (issue #101) — those scanners flag any directory that appears in
+# readdir() but is hidden from lstat(), which is exactly what AppImage's
+# FUSE mount layer looks like to them. Running from a plain extracted
+# directory has the same files but no FUSE indirection, so the false
+# positive disappears.
+extract_appimage_to_runtime_dir() {
+    local appimage_path="$1"
+    local target_runtime_dir="$2"
+    local tmp_extract_dir
+    tmp_extract_dir=$(mktemp -d /tmp/proxmenux-extract.XXXXXX) || return 1
+
+    msg_info "Extracting AppImage runtime to ${target_runtime_dir}..."
+
+    if ! ( cd "$tmp_extract_dir" && "$appimage_path" --appimage-extract >/dev/null 2>&1 ); then
+        msg_error "Failed to extract AppImage."
+        rm -rf "$tmp_extract_dir"
+        return 1
+    fi
+
+    if [ ! -x "$tmp_extract_dir/squashfs-root/AppRun" ]; then
+        msg_error "Extracted AppImage missing AppRun."
+        rm -rf "$tmp_extract_dir"
+        return 1
+    fi
+
+    rm -rf "${target_runtime_dir}.new"
+    mv "$tmp_extract_dir/squashfs-root" "${target_runtime_dir}.new"
+    rm -rf "$tmp_extract_dir"
+
+    if [ -d "$target_runtime_dir" ]; then
+        rm -rf "${target_runtime_dir}.old"
+        mv "$target_runtime_dir" "${target_runtime_dir}.old"
+    fi
+    mv "${target_runtime_dir}.new" "$target_runtime_dir"
+    rm -rf "${target_runtime_dir}.old"
+
+    rm -f "$appimage_path"
+
+    msg_ok "AppImage runtime extracted."
+    return 0
+}
+
+install_proxmenux_monitor() {
+    local appimage_source=$(detect_latest_appimage)
+    
+    if [ -z "$appimage_source" ] || [ ! -f "$appimage_source" ]; then
+        msg_error "ProxMenux Monitor AppImage not found in $TEMP_DIR/AppImage/"
+        msg_warn "Please ensure the AppImage directory exists with ProxMenux-*.AppImage files."
+        update_config "proxmenux_monitor" "appimage_not_found"
+        return 1
+    fi
+    
+    local appimage_version=$(get_appimage_version "$appimage_source")
+    
+    if systemctl is-active --quiet proxmenux-monitor.service; then
+        systemctl stop proxmenux-monitor.service
+    fi
+    
+    local service_exists=false
+    if [ -f "$MONITOR_SERVICE_FILE" ]; then
+        service_exists=true
+    fi
+    
+    local sha256_file="$TEMP_DIR/AppImage/ProxMenux-Monitor.AppImage.sha256"
+    
+    if [ -f "$sha256_file" ]; then
+        msg_info "Verifying AppImage integrity..."
+        local expected_hash=$(cat "$sha256_file" | grep -Eo '^[a-f0-9]+' | tr -d '\n')
+        local actual_hash=$(sha256sum "$appimage_source" | awk '{print $1}')
+        
+        if [ "$expected_hash" != "$actual_hash" ]; then
+            msg_error "SHA256 verification failed! AppImage may be corrupted."
+            return 1
+        fi
+        msg_ok "SHA256 verification passed."
+    else
+        msg_warn "SHA256 checksum not available. Skipping verification."
+    fi
+    
+    mkdir -p "$MONITOR_INSTALL_DIR"
+    
+    local target_path="$MONITOR_INSTALL_DIR/ProxMenux-Monitor.AppImage"
+    cp "$appimage_source" "$target_path"
+    chmod +x "$target_path"
+
+    if ! extract_appimage_to_runtime_dir "$target_path" "$MONITOR_RUNTIME_DIR"; then
+        update_config "proxmenux_monitor" "extract_failed"
+        return 1
+    fi
+
+    msg_ok "ProxMenux Monitor v$appimage_version installed."
+
+    if [ "$service_exists" = false ]; then
+        return 0  # New installation - service needs to be created
+    else
+        # The v1.2.2 install layout extracts the AppImage into
+        # MONITOR_RUNTIME_DIR/ and runs AppRun out of that directory
+        # (`extract_appimage_to_runtime_dir` above), so the unit must
+        # point at AppRun — not at the bare AppImage. Existing users
+        # updating from v1.2.1.x stable still have a unit whose
+        # ExecStart targets `/usr/local/share/proxmenux/ProxMenux-Monitor.AppImage`
+        # which was fine when the AppImage was FUSE-mounted but breaks
+        # under PVE 9.x / Debian 13 (status=203/EXEC, GitHub issue #222).
+        # Rewrite the unit on every update — idempotent for users
+        # whose unit is already correct.
+        _proxmenux_rewrite_monitor_unit_for_apprun
+
+        systemctl start proxmenux-monitor.service
+        sleep 2
+
+        if systemctl is-active --quiet proxmenux-monitor.service; then
+
+            update_config "proxmenux_monitor" "updated"
+            return 2  # Update successful
+        else
+            msg_warn "Service failed to restart. Check: journalctl -u proxmenux-monitor"
+            update_config "proxmenux_monitor" "failed"
+            return 1
+        fi
+    fi
+}
+
+# Idempotent rewriter of the proxmenux-monitor unit file. Used by the
+# update path in `install_proxmenux_monitor` so that existing
+# installations updated to v1.2.2+ get their ExecStart corrected to
+# point at the extracted AppRun even when the unit already exists.
+# Mirrors `create_monitor_service`'s unit body so both code paths
+# converge on the same file content. Returns 0 always; failures are
+# logged so the surrounding flow can still attempt the start and
+# report a more accurate failure to the user.
+_proxmenux_rewrite_monitor_unit_for_apprun() {
+    local exec_path="$MONITOR_RUNTIME_DIR/AppRun"
+
+    if [ -f "$TEMP_DIR/systemd/proxmenux-monitor.service" ]; then
+        sed "s|ExecStart=.*|ExecStart=$exec_path|g" \
+            "$TEMP_DIR/systemd/proxmenux-monitor.service" > "$MONITOR_SERVICE_FILE"
+    else
+        cat > "$MONITOR_SERVICE_FILE" << EOF
+[Unit]
+Description=ProxMenux Monitor - Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$MONITOR_INSTALL_DIR
+ExecStart=$exec_path
+Restart=on-failure
+RestartSec=10
+Environment="PORT=$MONITOR_PORT"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+
+    systemctl daemon-reload
+    return 0
+}
+
+create_monitor_service() {
+    
+    local exec_path="$MONITOR_RUNTIME_DIR/AppRun"
+    
+    if [ -f "$TEMP_DIR/systemd/proxmenux-monitor.service" ]; then
+        sed "s|ExecStart=.*|ExecStart=$exec_path|g" \
+            "$TEMP_DIR/systemd/proxmenux-monitor.service" > "$MONITOR_SERVICE_FILE"
+        msg_ok "Using service file from repository."
+    else
+        cat > "$MONITOR_SERVICE_FILE" << EOF
+[Unit]
+Description=ProxMenux Monitor - Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$MONITOR_INSTALL_DIR
+ExecStart=$exec_path
+Restart=on-failure
+RestartSec=10
+Environment="PORT=$MONITOR_PORT"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        msg_ok "Created default service file."
+    fi
+
+    systemctl daemon-reload
+    systemctl enable proxmenux-monitor.service > /dev/null 2>&1
+    systemctl start proxmenux-monitor.service > /dev/null 2>&1
+    
+    sleep 3
+    
+    if systemctl is-active --quiet proxmenux-monitor.service; then
+        msg_ok "ProxMenux Monitor service started successfully."
+        update_config "proxmenux_monitor" "installed"
+        return 0
+    else
+        msg_warn "ProxMenux Monitor service failed to start."
+        msg_info2 "Check logs with: journalctl -u proxmenux-monitor -n 20"
+        msg_info2 "Check status with: systemctl status proxmenux-monitor"
+        update_config "proxmenux_monitor" "failed"
+        return 1
+    fi
+}
+
+install_normal_version() {
+    local total_steps=6
+    local current_step=1
+
+    # Translations now live as pre-generated JSON files under lang/, so
+    # asking the language up front is the right place — every install is
+    # multilingual-capable and the user picks once.
+    show_progress $current_step $total_steps "Language selection"
+    select_language
+    ((current_step++))
+
+    # Purge the legacy googletrans virtualenv if a previous install left it
+    # behind. The new translate flow has no runtime Python/googletrans
+    # dependency — the venv is dead weight on disk now.
+    if [[ -d "$LEGACY_VENV_PATH" ]]; then
+        msg_info "Removing legacy translation virtualenv at $LEGACY_VENV_PATH..."
+        rm -rf "$LEGACY_VENV_PATH"
+        msg_ok "Legacy translation virtualenv removed."
+    fi
+
+    show_progress $current_step $total_steps "Installing basic dependencies."
+
+    msg_info "Refreshing apt cache..."
+    apt-get update -y > /dev/null 2>&1 || true
+    msg_ok "apt cache refreshed."
+
+    msg_info "Installing jq..."
+    if ! command -v jq > /dev/null 2>&1; then
+        if apt-get install -y jq > /dev/null 2>&1 && command -v jq > /dev/null 2>&1; then
+            update_config "jq" "installed"
+        else
+            local jq_url="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64"
+            if wget -q -O /usr/local/bin/jq "$jq_url" 2>/dev/null && chmod +x /usr/local/bin/jq; then
+                if command -v jq > /dev/null 2>&1; then
+                    update_config "jq" "installed_from_github"
+                else
+                    msg_error "Failed to install jq. Please install it manually."
+                    update_config "jq" "failed"
+                    return 1
+                fi
+            else
+                msg_error "Failed to install jq from both APT and GitHub. Please install it manually."
+                update_config "jq" "failed"
+                return 1
+            fi
+        fi
+    else
+        update_config "jq" "already_installed"
+    fi
+    msg_ok "jq ready."
+
+    BASIC_DEPS=("dialog" "curl" "git")
+
+    for pkg in "${BASIC_DEPS[@]}"; do
+        msg_info "Installing $pkg..."
+        # dpkg-query for the EXACT package — `dpkg -l | grep -qw python3`
+        # falsely matches `python3-pip`. Issue #205.
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            if apt-get install -y "$pkg" > /dev/null 2>&1; then
+                update_config "$pkg" "installed"
+            else
+                msg_error "Failed to install $pkg. Please install it manually."
+                update_config "$pkg" "failed"
+                return 1
+            fi
+        else
+            update_config "$pkg" "already_installed"
+        fi
+        msg_ok "$pkg ready."
+    done
+
+
+    if ! command -v git > /dev/null 2>&1; then
+        msg_info "Installing git (required to clone the ProxMenux repository)."
+
+
+        if [ -z "${APT_UPDATED:-}" ]; then
+            apt-get update -y > /dev/null 2>&1 || true
+            APT_UPDATED=1
+        fi
+
+        if ! apt-get install -y git > /dev/null 2>&1; then
+            msg_error "Failed to install git. Please run 'apt-get install git' manually and rerun the installer."
+            update_config "git" "failed"
+            return 1
+        fi
+
+
+        if ! command -v git > /dev/null 2>&1; then
+            msg_error "Git is still not available after installation. Aborting to avoid a broken setup."
+            update_config "git" "failed"
+            return 1
+        fi
+
+        update_config "git" "installed"
+    else
+        update_config "git" "already_installed"
+    fi
+
+    msg_ok "jq, dialog, curl and git installed successfully."
+
+
+
+
+
+
+    ((current_step++))
+
+    show_progress $current_step $total_steps "Install ProxMenux repository"
+    msg_info "Cloning ProxMenux repository."
+    if ! git clone --depth 1 "$REPO_URL" "$TEMP_DIR" 2>/dev/null; then
+        msg_error "Failed to clone repository from $REPO_URL"
+        exit 1
+    fi
+
+    msg_ok "Repository cloned successfully."
+
+    cd "$TEMP_DIR"
+
+    ((current_step++))
+    
+    show_progress $current_step $total_steps "Creating directories and configuration"
+    
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$INSTALL_DIR"
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo '{}' > "$CONFIG_FILE"
+    fi
+    
+    msg_ok "Directories and configuration created."
+    ((current_step++))
+    
+    show_progress $current_step $total_steps "Copying necessary files"
+    
+    cp "./scripts/utils.sh" "$UTILS_FILE"
+    # Atomic install of /usr/local/bin/menu: stage to .new on the same
+    # filesystem then mv. This protects any reader that happens to open
+    # the file mid-install from seeing a partial/half-written script
+    # (the suspected root cause of the post-1.2.2-update reports:
+    #   "menu: line 138 syntax error near unexpected token `$REMOTE_VERSION`")
+    cp "./menu" "$INSTALL_DIR/${MENU_SCRIPT}.new"
+    mv -f "$INSTALL_DIR/${MENU_SCRIPT}.new" "$INSTALL_DIR/$MENU_SCRIPT"
+    cp "./version.txt" "$LOCAL_VERSION_FILE"
+    cp "./install_proxmenux.sh" "$BASE_DIR/install_proxmenux.sh"
+
+    # Pre-built translation cache. The runtime translate() in utils.sh
+    # reads $BASE_DIR/lang/<lang>.json — these files ship with the repo
+    # (one per supported language) so the install ends up multilingual
+    # without any runtime download or Python dependency. Refresh the
+    # whole dir on every install so a language that was renamed or
+    # dropped upstream disappears here too.
+    if [ -d "./lang" ]; then
+        rm -rf "$BASE_DIR/lang"
+        mkdir -p "$BASE_DIR/lang"
+        cp -r "./lang/"* "$BASE_DIR/lang/" 2>/dev/null || true
+    fi
+
+    # A user that previously rode the beta train and then switched back
+    # to stable would still have a leftover beta_version.txt under
+    # $BASE_DIR, which makes the `menu` update check (check_updates_beta)
+    # offer a "Beta update available" prompt on top of the legitimate
+    # stable one. Clearing the marker on every stable install/update
+    # keeps the stable install honestly stable — if the user opts into
+    # the beta program again, the beta installer will recreate the file.
+    rm -f "$BASE_DIR/beta_version.txt"
+
+    # Wipe the scripts tree before copying so any file removed upstream
+    # (renamed, consolidated, deprecated) disappears from the user install.
+    # Only $BASE_DIR/scripts/ is cleared; config.json,
+    # components_status.json, version.txt, monitor.db, smart/, oci/ and
+    # the AppImage live outside this path and are preserved.
+    rm -rf "$BASE_DIR/scripts"
+    mkdir -p "$BASE_DIR/scripts"
+    cp -r "./scripts/"* "$BASE_DIR/scripts/"
+    # Only .sh files need the executable bit. Applying +x recursively would
+    # also flag README.md, .json, .py etc. as executable for no reason.
+    find "$BASE_DIR/scripts" -type f -name '*.sh' -exec chmod +x {} +
+    chmod +x "$BASE_DIR/install_proxmenux.sh"
+    msg_ok "Necessary files created."
+
+    chmod +x "$INSTALL_DIR/$MENU_SCRIPT"
+
+    ((current_step++))
+    show_progress $current_step $total_steps "Installing ProxMenux Monitor"
+    
+    install_proxmenux_monitor
+    local monitor_status=$?
+    
+    if [ $monitor_status -eq 0 ]; then
+        create_monitor_service
+    fi
+    
+    msg_ok "ProxMenux installation completed successfully."
+}
+
+show_installation_options() {
+    local current_install_type
+    current_install_type=$(check_existing_installation)
+    # Translation Version is gone — translations now ship as pre-built
+    # JSON files in lang/. There is only one install path, so this
+    # function just shows the confirmation dialog for new installs and
+    # then returns. Existing installs go straight through (they already
+    # consented to update via the menu).
+    INSTALL_TYPE="1"
+
+    if [ "$current_install_type" = "none" ]; then
+        if ! show_installation_confirmation "$INSTALL_TYPE"; then
+            show_proxmenux_logo
+            msg_warn "Installation cancelled."
+            exit 1
+        fi
+    fi
+}
+
+install_proxmenux() {
+    if [[ "${UPDATE_MODE:-0}" == "1" ]]; then
+        # Update path: the user already accepted "Update now?" in the
+        # menu. Hand off to the freshly-installed menu binary at the end
+        # (exec, see below) so no shell ever returns to a half-written
+        # /usr/local/bin/menu — the new copy is the only thing parsed.
+        show_proxmenux_logo
+        msg_title "Updating ProxMenux"
+        install_normal_version
+    else
+        show_installation_options
+        show_proxmenux_logo
+        msg_title "Installing ProxMenux"
+        install_normal_version
+    fi
+
+    if [[ -f "$UTILS_FILE" ]]; then
+    source "$UTILS_FILE"
+    fi
+
+    # ── Legacy gpu-guard hookscript auto-cleanup ──────────────
+    # Previous ProxMenux versions attached a hookscript to VMs/LXCs with GPU
+    # passthrough; that reference in the guest .conf broke backup/restore to
+    # hosts without the snippet. The hookscript system has been removed.
+    # This silently purges any leftover references and the snippet file.
+    # Idempotent: does nothing on hosts that never had the legacy hook.
+    if [ -x "$LOCAL_SCRIPTS/global/cleanup_gpu_hookscripts.sh" ]; then
+        bash "$LOCAL_SCRIPTS/global/cleanup_gpu_hookscripts.sh" || true
+    fi
+
+    # UPDATE_MODE used to `exec "$INSTALL_DIR/$MENU_SCRIPT"` here to
+    # auto-relaunch the freshly-installed menu. That produced visible
+    # "line: syntax" errors when bash tried to read the just-rewritten
+    # /usr/local/bin/menu (or a shared utils.sh sourced by it) under
+    # its feet. Fall through to the standard "installed successfully"
+    # end-of-run message instead — the operator types `menu` when
+    # ready and the terminal is stable by then.
+    #
+    # `change_release_channel` in scripts/menus/config_menu.sh is
+    # unaffected: it invokes the installer without `--update`
+    # (UPDATE_MODE=0) so it never went through this branch, and its
+    # "return to config menu" behaviour is preserved.
+
+    msg_title "ProxMenux has been installed successfully"
+
+    if systemctl is-active --quiet proxmenux-monitor.service; then
+        local server_ip=$(get_server_ip)
+        echo -e "${GN}🌐  ProxMenux Monitor activated${CL}: ${BL}http://${server_ip}:${MONITOR_PORT}${CL}"
+        echo
+    fi
+
+    echo -ne "${GN}"
+    type_text "To run ProxMenux, simply execute this command in the console or terminal:"
+    echo -e "${YWB}    menu${CL}"
+    echo
+    # -------
+    exit 0
+}
+
+# Parse CLI flags before anything else so install_proxmenux() can
+# branch on UPDATE_MODE without re-reading "$@".
+if [[ "${1:-}" == "--update" ]]; then
+    UPDATE_MODE=1
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    msg_error "This script must be run as root."
+    exit 1
+fi
+
+cleanup_corrupted_files
+install_proxmenux
